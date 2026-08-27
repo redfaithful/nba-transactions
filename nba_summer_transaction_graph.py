@@ -40,6 +40,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import time
@@ -2716,6 +2717,8 @@ def draw_interactive_graph(
     edge_alphas = edge_visual_alphas(graph)
     lanes = interactive_edge_lanes(graph)
     labelled_edges = selected_edge_labels(graph, maximum_labels)
+    destination_edge_ids: dict[str, list[str]] = defaultdict(list)
+    edge_labels: dict[str, str] = {}
 
     edges = sorted(
         graph.edges(keys=True, data=True),
@@ -2737,6 +2740,11 @@ def draw_interactive_graph(
         )
         source_anchor = f"__edge_{edge_number}_from"
         destination_anchor = f"__edge_{edge_number}_to"
+        visible_edge_id = f"player_edge_{edge_number}"
+        destination_edge_ids[destination].append(visible_edge_id)
+        edge_labels[visible_edge_id] = (
+            f"{data['player']} ({format_salary(data.get('salary'))})"
+        )
 
         # These nodes are effectively invisible but remain valid geometric edge
         # endpoints.  Do not use hidden=True: vis-network hides incident edges
@@ -2821,6 +2829,7 @@ def draw_interactive_graph(
         network.add_edge(
             source_anchor,
             destination_anchor,
+            id=visible_edge_id,
             label=data["player"] if edge_id in labelled_edges else "",
             title=tooltip,
             dashes=data["move_type"] != "trade",
@@ -2857,6 +2866,8 @@ def draw_interactive_graph(
             "font": {
               "size": 10,
               "align": "middle",
+              "color": "#0b1f33",
+              "strokeWidth": 0,
               "background": "rgba(255,255,255,0.88)"
             },
             "arrowStrikethrough": false,
@@ -2872,6 +2883,17 @@ def draw_interactive_graph(
     network.write_html(str(output_path), open_browser=False)
 
     html = output_path.read_text(encoding="utf-8")
+    # PyVis emits this helper as a path relative to the HTML file. Resolve it
+    # against this project's shared lib directory so HTML files generated into
+    # output/ (or src/output/) work when opened directly from file://.
+    shared_lib_dir = Path(__file__).resolve().parent / "lib"
+    relative_lib_dir = Path(
+        os.path.relpath(shared_lib_dir, output_path.parent.resolve())
+    ).as_posix()
+    html = html.replace(
+        'src="lib/bindings/utils.js"',
+        f'src="{relative_lib_dir}/bindings/utils.js"',
+    )
 
     html = html.replace(
         "</head>",
@@ -2983,6 +3005,35 @@ def draw_interactive_graph(
                 white-space: normal;
             }
 
+            #team-player-tooltip {
+                position: fixed;
+                display: none;
+                z-index: 1100;
+                max-width: 440px;
+                max-height: 60vh;
+                overflow-y: auto;
+                padding: 10px 12px;
+                background: rgba(255, 255, 255, 0.97);
+                border: 1px solid rgba(11, 31, 51, 0.35);
+                border-radius: 6px;
+                box-shadow: 0 3px 14px rgba(0, 0, 0, 0.22);
+                color: #0b1f33;
+                font-family: Arial, sans-serif;
+                font-size: 12px;
+                line-height: 1.4;
+                pointer-events: none;
+                white-space: nowrap;
+            }
+
+            #team-player-tooltip .team-player-tooltip-title {
+                margin-bottom: 5px;
+                font-weight: 700;
+            }
+
+            #team-player-tooltip .team-player-tooltip-player {
+                margin: 2px 0;
+            }
+
             @media (max-width: 700px) {
                 #graph-legend {
                     top: 8px;
@@ -3027,9 +3078,114 @@ def draw_interactive_graph(
                 <span class="legend-line legend-thick"></span>
                 <span>Higher salary</span>
             </div>
-            <div class="legend-note">Arrow direction shows the destination team. Hover over an edge for player and salary.</div>
+            <div class="legend-note">Arrow direction shows the destination team.</div>
+            <div class="legend-note">Hover over an edge for player and salary.</div>
+            <div class="legend-note">Hover over a team for an incoming player/salary tooltip.</div>
         </div>
+        <div id="team-player-tooltip" role="status"></div>
         <script>
+            const playerEdgesByDestination = %s;
+            const playerEdgeLabels = %s;
+            const playerEdgeSalaries = %s;
+            let hoveredDestinationTeam = null;
+
+            function positionTeamTooltip(pointer) {
+                const tooltip = document.getElementById("team-player-tooltip");
+                if (!tooltip || !pointer) {
+                    return;
+                }
+
+                const margin = 8;
+                const offset = 14;
+                const left = Math.min(
+                    pointer.x + offset,
+                    window.innerWidth - tooltip.offsetWidth - margin
+                );
+                const top = Math.min(
+                    pointer.y + offset,
+                    window.innerHeight - tooltip.offsetHeight - margin
+                );
+                tooltip.style.left = Math.max(margin, left) + "px";
+                tooltip.style.top = Math.max(margin, top) + "px";
+            }
+
+            function showTeamTooltip(team, pointer) {
+                const tooltip = document.getElementById("team-player-tooltip");
+                if (!tooltip) {
+                    return;
+                }
+
+                tooltip.replaceChildren();
+                const title = document.createElement("div");
+                title.className = "team-player-tooltip-title";
+                title.textContent = team + " incoming players";
+                tooltip.appendChild(title);
+
+                (playerEdgesByDestination[team] || [])
+                    .slice()
+                    .sort(function (firstEdgeId, secondEdgeId) {
+                        return (
+                            (playerEdgeSalaries[secondEdgeId] || 0) -
+                            (playerEdgeSalaries[firstEdgeId] || 0)
+                        );
+                    })
+                    .forEach(function (edgeId) {
+                    const player = document.createElement("div");
+                    player.className = "team-player-tooltip-player";
+                    player.textContent = playerEdgeLabels[edgeId];
+                    tooltip.appendChild(player);
+                    });
+
+                tooltip.style.display = "block";
+                positionTeamTooltip(pointer);
+            }
+
+            function hideTeamTooltip() {
+                const tooltip = document.getElementById("team-player-tooltip");
+                if (tooltip) {
+                    tooltip.style.display = "none";
+                }
+            }
+
+            function isTeamNode(nodeId) {
+                return (
+                    typeof nodeId === "string" &&
+                    !nodeId.startsWith("__edge_")
+                );
+            }
+
+            network.on("hoverNode", function (params) {
+                if (!isTeamNode(params.node)) {
+                    return;
+                }
+                hoveredDestinationTeam = params.node;
+                showTeamTooltip(
+                    hoveredDestinationTeam,
+                    params.pointer && params.pointer.DOM
+                );
+            });
+
+            network.on("mousemove", function (params) {
+                if (
+                    hoveredDestinationTeam !== null &&
+                    params.pointer &&
+                    params.pointer.DOM
+                ) {
+                    positionTeamTooltip(params.pointer.DOM);
+                }
+            });
+
+            network.on("blurNode", function (params) {
+                if (
+                    !isTeamNode(params.node) ||
+                    hoveredDestinationTeam !== params.node
+                ) {
+                    return;
+                }
+                hoveredDestinationTeam = null;
+                hideTeamTooltip();
+            });
+
             function resizeNetworkCanvas() {
                 const container = document.getElementById("mynetwork");
 
@@ -3064,7 +3220,22 @@ def draw_interactive_graph(
             });
         </script>
         </body>
-        """,
+        """ % (
+            json.dumps(destination_edge_ids),
+            json.dumps(edge_labels),
+            json.dumps(
+                {
+                    edge_id: data.get("salary") or 0
+                    for edge_id, (*_edge, data) in zip(
+                        [
+                            f"player_edge_{edge_number}"
+                            for edge_number in range(len(edges))
+                        ],
+                        edges,
+                    )
+                }
+            ),
+        ),
     )
 
     output_path.write_text(html, encoding="utf-8")
@@ -3090,6 +3261,49 @@ def save_tables(
     pd.DataFrame(unresolved_salaries).to_csv(
         output_dir / "unresolved_salaries.csv", index=False
     )
+
+
+def load_cached_movements(path: Path) -> list[Movement]:
+    """Load previously resolved movements for offline HTML regeneration."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot run HTML-only mode: movements file not found: {path}"
+        )
+
+    frame = pd.read_csv(path)
+    required_columns = {
+        "player",
+        "source",
+        "destination",
+        "move_type",
+        "date",
+        "description",
+        "player_url",
+        "salary",
+        "salary_source",
+    }
+    missing_columns = required_columns - set(frame.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Cannot run HTML-only mode: missing columns: {missing}")
+
+    movements: list[Movement] = []
+    for row in frame.to_dict("records"):
+        salary = row["salary"]
+        movements.append(
+            Movement(
+                player=str(row["player"]),
+                source=str(row["source"]),
+                destination=str(row["destination"]),
+                move_type=str(row["move_type"]),
+                date=str(row["date"]),
+                description=str(row["description"]),
+                player_url=str(row["player_url"]),
+                salary=None if pd.isna(salary) else int(float(salary)),
+                salary_source=str(row["salary_source"]),
+            )
+        )
+    return movements
 
 
 def build_browser_context(
@@ -3125,6 +3339,14 @@ def build_browser_context(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--html-only",
+        action="store_true",
+        help=(
+            "Regenerate only the interactive HTML from output/movements.csv; "
+            "do not create a browser or fetch data."
+        ),
+    )
     parser.add_argument(
         "--headed",
         action="store_true",
@@ -3263,6 +3485,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if args.html_only:
+        movements = load_cached_movements(args.output_dir / "movements.csv")
+        graph = movement_graph(movements)
+        positions = compute_team_layout(
+            graph,
+            restarts=max(args.layout_restarts, 1),
+            refinement_steps=max(args.layout_refinement_steps, 0),
+        )
+        draw_interactive_graph(
+            graph,
+            positions,
+            args.output_dir / "nba_summer_transactions.html",
+            maximum_labels=max(args.interactive_label_count, 0),
+            endpoint_gap=max(args.interactive_edge_node_gap, 0.0),
+            parallel_edge_spacing=max(args.interactive_parallel_edge_spacing, 0.0),
+            hover_target_width=max(args.interactive_edge_hover_width, 0.0),
+            team_label_vadjust=args.interactive_team_label_vadjust,
+        )
+        print(
+            f"Generated HTML-only graph from {len(movements)} cached movements: "
+            f"{(args.output_dir / 'nba_summer_transactions.html').resolve()}"
+        )
+        return
+
     overrides = load_overrides(args.overrides)
     salary_overrides = load_salary_overrides(args.salary_overrides)
     cached_drafted_players = load_drafted_players(args.cache_dir)
